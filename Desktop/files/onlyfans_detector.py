@@ -2,6 +2,7 @@
 """
 Standalone OnlyFans Detector for n8n Integration
 Detects OnlyFans links in bio landing pages (Linktree, Linkme, Beacons, etc.)
+Uses pyppeteer (Puppeteer for Python) for better Heroku compatibility
 """
 
 import asyncio
@@ -13,7 +14,7 @@ from typing import Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
 import httpx
-from playwright.async_api import async_playwright
+from pyppeteer import launch
 
 # OnlyFans detection regex
 OF_REGEX = re.compile(r"onlyfans\.com", re.IGNORECASE)
@@ -46,7 +47,7 @@ class OnlyFansDetector:
             if await self._check_direct_links(bio_link):
                 return self.results
             
-            # Method 2: Interactive page analysis
+            # Method 2: Interactive page analysis with Puppeteer
             if await self._check_interactive_page(bio_link):
                 return self.results
             
@@ -86,95 +87,105 @@ class OnlyFansDetector:
         return False
     
     async def _check_interactive_page(self, bio_link: str) -> bool:
-        """Use Playwright to interact with the page and detect OnlyFans"""
+        """Use Puppeteer to interact with the page and detect OnlyFans"""
         try:
-            async with async_playwright() as p:
-                # Heroku-compatible browser launch with specific flags
-                browser = await p.chromium.launch(
-                    headless=self.headless,
-                    args=[
-                        '--no-sandbox',
-                        '--disable-setuid-sandbox',
-                        '--disable-dev-shm-usage',
-                        '--disable-accelerated-2d-canvas',
-                        '--no-first-run',
-                        '--no-zygote',
-                        '--disable-gpu',
-                        '--single-process'
-                    ]
-                )
-                context = await browser.new_context()
-                page = await context.new_page()
+            # Launch Puppeteer with Heroku-compatible options
+            browser = await launch(
+                headless=self.headless,
+                args=[
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-accelerated-2d-canvas',
+                    '--no-first-run',
+                    '--no-zygote',
+                    '--disable-gpu',
+                    '--single-process',
+                    '--disable-web-security',
+                    '--disable-features=VizDisplayCompositor'
+                ]
+            )
+            
+            page = await browser.newPage()
+            
+            # Track redirects
+            onlyfans_redirects = []
+            
+            # Listen for redirects
+            page.on('response', lambda response: self._handle_response(response, onlyfans_redirects))
+            
+            try:
+                # Load the bio link page
+                await page.goto(bio_link, {'waitUntil': 'domcontentloaded', 'timeout': 30000})
+                await page.waitFor(3000)  # Wait for JS to load
                 
-                # Track redirects
-                onlyfans_redirects = []
-                
-                def handle_response(response):
-                    if response.status >= 300 and response.status < 400:
-                        location = response.headers.get('location', '')
-                        if 'onlyfans.com' in location.lower() and '/files' not in location:
-                            onlyfans_redirects.append(location)
-                
-                page.on('response', handle_response)
-                
+                # Accept cookies if present
                 try:
-                    # Load the bio link page
-                    await page.goto(bio_link, wait_until="domcontentloaded", timeout=30000)
-                    await page.wait_for_timeout(3000)  # Wait for JS to load
-                    
-                    # Accept cookies if present
-                    try:
-                        accept_selectors = [
-                            "button:has-text('Accept All')",
-                            "button:has-text('Accept')",
-                            "button:has-text('OK')",
-                            "button:has-text('Got it')"
-                        ]
-                        for selector in accept_selectors:
-                            if await page.locator(selector).count() > 0:
-                                await page.locator(selector).click()
-                                await page.wait_for_timeout(2000)
+                    accept_selectors = [
+                        "button:has-text('Accept All')",
+                        "button:has-text('Accept')",
+                        "button:has-text('OK')",
+                        "button:has-text('Got it')"
+                    ]
+                    for selector in accept_selectors:
+                        try:
+                            accept_btn = await page.querySelector(selector)
+                            if accept_btn:
+                                await accept_btn.click()
+                                await page.waitFor(2000)
                                 break
-                    except:
-                        pass
-                    
-                    # Get all links from the page
-                    all_links = await self._extract_all_links(page, bio_link)
-                    
-                    # Check for OnlyFans in extracted links
-                    of_links = [link for link in all_links if OF_REGEX.search(link) and '/files' not in link and '/public' not in link]
-                    
-                    if of_links:
-                        self.results["has_onlyfans"] = True
-                        self.results["onlyfans_urls"] = of_links
-                        self.results["detection_method"] = "interactive_link_extraction"
-                        self.results["debug_info"].append(f"Found {len(of_links)} OnlyFans links via interactive extraction")
-                        await browser.close()
-                        return True
-                    
-                    # Try clicking interactive elements to trigger redirects
-                    if await self._try_interactive_clicks(page, bio_link):
-                        await browser.close()
-                        return True
-                    
-                    # Check if we captured any redirects
-                    if onlyfans_redirects:
-                        self.results["has_onlyfans"] = True
-                        self.results["onlyfans_urls"] = onlyfans_redirects
-                        self.results["detection_method"] = "redirect_capture"
-                        self.results["debug_info"].append(f"Captured {len(onlyfans_redirects)} OnlyFans redirects")
-                        await browser.close()
-                        return True
-                    
-                except Exception as e:
-                    self.results["errors"].append(f"Interactive page check failed: {str(e)}")
-                finally:
+                        except:
+                            continue
+                except:
+                    pass
+                
+                # Get all links from the page
+                all_links = await self._extract_all_links(page, bio_link)
+                
+                # Check for OnlyFans in extracted links
+                of_links = [link for link in all_links if OF_REGEX.search(link) and '/files' not in link and '/public' not in link]
+                
+                if of_links:
+                    self.results["has_onlyfans"] = True
+                    self.results["onlyfans_urls"] = of_links
+                    self.results["detection_method"] = "interactive_link_extraction"
+                    self.results["debug_info"].append(f"Found {len(of_links)} OnlyFans links via interactive extraction")
                     await browser.close()
-                    
+                    return True
+                
+                # Try clicking interactive elements to trigger redirects
+                if await self._try_interactive_clicks(page, bio_link):
+                    await browser.close()
+                    return True
+                
+                # Check if we captured any redirects
+                if onlyfans_redirects:
+                    self.results["has_onlyfans"] = True
+                    self.results["onlyfans_urls"] = onlyfans_redirects
+                    self.results["detection_method"] = "redirect_capture"
+                    self.results["debug_info"].append(f"Captured {len(onlyfans_redirects)} OnlyFans redirects")
+                    await browser.close()
+                    return True
+                
+            except Exception as e:
+                self.results["errors"].append(f"Interactive page check failed: {str(e)}")
+            finally:
+                await browser.close()
+                
         except Exception as e:
-            self.results["errors"].append(f"Playwright setup failed: {str(e)}")
+            self.results["errors"].append(f"Puppeteer setup failed: {str(e)}")
         
         return False
+    
+    def _handle_response(self, response, onlyfans_redirects):
+        """Handle response events to capture redirects"""
+        try:
+            if response.status >= 300 and response.status < 400:
+                location = response.headers.get('location', '')
+                if 'onlyfans.com' in location.lower() and '/files' not in location:
+                    onlyfans_redirects.append(location)
+        except:
+            pass
     
     async def _extract_all_links(self, page, base_url: str) -> List[str]:
         """Extract all links from the page"""
@@ -182,39 +193,41 @@ class OnlyFansDetector:
         
         try:
             # Get all href attributes
-            anchors = page.locator("a[href]")
-            count = await anchors.count()
-            for i in range(min(count, 100)):
-                try:
-                    href = await anchors.nth(i).get_attribute("href")
-                    if href:
-                        if href.startswith('/'):
-                            full_url = urljoin(base_url, href)
-                            links.append(full_url)
-                        elif href.startswith('http'):
-                            links.append(href)
-                except Exception:
-                    continue
+            hrefs = await page.evaluate('''
+                () => {
+                    const anchors = document.querySelectorAll('a[href]');
+                    return Array.from(anchors).map(a => a.href);
+                }
+            ''')
+            
+            for href in hrefs:
+                if href and href.startswith('http'):
+                    links.append(href)
+                elif href and href.startswith('/'):
+                    full_url = urljoin(base_url, href)
+                    links.append(full_url)
             
             # Check for data attributes
-            data_attrs = ["data-url", "data-href", "data-link", "data-target"]
-            for attr in data_attrs:
-                elements = page.locator(f"[{attr}]")
-                count = await elements.count()
-                for i in range(min(count, 50)):
-                    try:
-                        value = await elements.nth(i).get_attribute(attr)
-                        if value and ('http' in value or '/' in value):
-                            if value.startswith('http'):
-                                links.append(value)
-                            elif value.startswith('/'):
-                                links.append(urljoin(base_url, value))
-                    except Exception:
-                        continue
+            data_urls = await page.evaluate('''
+                () => {
+                    const elements = document.querySelectorAll('[data-url], [data-href], [data-link], [data-target]');
+                    return Array.from(elements).map(el => {
+                        return el.getAttribute('data-url') || el.getAttribute('data-href') || 
+                               el.getAttribute('data-link') || el.getAttribute('data-target');
+                    }).filter(url => url);
+                }
+            ''')
+            
+            for url in data_urls:
+                if url and ('http' in url or '/' in url):
+                    if url.startswith('http'):
+                        links.append(url)
+                    elif url.startswith('/'):
+                        links.append(urljoin(base_url, url))
             
             # Check page content for OnlyFans URLs
             try:
-                page_text = await page.content()
+                page_text = await page.evaluate('() => document.body.innerText')
                 text_urls = re.findall(r'https?://[^\s<>"\']*onlyfans\.com[^\s<>"\']*', page_text, re.IGNORECASE)
                 links.extend(text_urls)
             except Exception:
@@ -247,36 +260,39 @@ class OnlyFansDetector:
         """Handle Link.me specific click patterns"""
         try:
             # Look for OnlyFans container and click it
-            onlyfans_container = page.locator(".singlealbum.singlebigitem.socialmedialink:has-text('OnlyFans')")
+            onlyfans_container = await page.querySelector(".singlealbum.singlebigitem.socialmedialink")
             
-            if await onlyfans_container.count() > 0:
-                await onlyfans_container.click(force=True)
-                await page.wait_for_timeout(3000)
-                
-                # Look for Continue button
-                continue_selectors = [
-                    "button:has-text('Continue')",
-                    "button:has-text('CONTINUE')",
-                    "button:has-text('Proceed')",
-                    "button:has-text('Enter')"
-                ]
-                
-                for selector in continue_selectors:
-                    try:
-                        continue_btn = page.locator(selector)
-                        if await continue_btn.count() > 0:
-                            await continue_btn.click()
-                            await page.wait_for_timeout(5000)
-                            
-                            current_url = page.url
-                            if 'onlyfans.com' in current_url.lower() and '/files' not in current_url:
-                                self.results["has_onlyfans"] = True
-                                self.results["onlyfans_urls"] = [current_url]
-                                self.results["detection_method"] = "linkme_interactive"
-                                self.results["debug_info"].append("Successfully clicked through Link.me OnlyFans flow")
-                                return True
-                    except Exception:
-                        continue
+            if onlyfans_container:
+                # Check if it contains OnlyFans text
+                text = await page.evaluate('(el) => el.textContent', onlyfans_container)
+                if 'onlyfans' in text.lower():
+                    await onlyfans_container.click()
+                    await page.waitFor(3000)
+                    
+                    # Look for Continue button
+                    continue_selectors = [
+                        "button:has-text('Continue')",
+                        "button:has-text('CONTINUE')",
+                        "button:has-text('Proceed')",
+                        "button:has-text('Enter')"
+                    ]
+                    
+                    for selector in continue_selectors:
+                        try:
+                            continue_btn = await page.querySelector(selector)
+                            if continue_btn:
+                                await continue_btn.click()
+                                await page.waitFor(5000)
+                                
+                                current_url = page.url
+                                if 'onlyfans.com' in current_url.lower() and '/files' not in current_url:
+                                    self.results["has_onlyfans"] = True
+                                    self.results["onlyfans_urls"] = [current_url]
+                                    self.results["detection_method"] = "linkme_interactive"
+                                    self.results["debug_info"].append("Successfully clicked through Link.me OnlyFans flow")
+                                    return True
+                        except Exception:
+                            continue
             
         except Exception as e:
             self.results["errors"].append(f"Link.me clicks failed: {str(e)}")
@@ -287,13 +303,11 @@ class OnlyFansDetector:
         """Handle Linktree specific click patterns"""
         try:
             # Look for LinkButton elements
-            link_buttons = page.locator("[data-testid*='LinkButton']")
-            count = await link_buttons.count()
+            link_buttons = await page.querySelectorAll("[data-testid*='LinkButton']")
             
-            for i in range(min(count, 10)):
+            for button in link_buttons[:10]:  # Check first 10 buttons
                 try:
-                    element = link_buttons.nth(i)
-                    href = await element.get_attribute('href')
+                    href = await page.evaluate('(el) => el.href', button)
                     if href and 'onlyfans.com' in href.lower() and '/files' not in href:
                         self.results["has_onlyfans"] = True
                         self.results["onlyfans_urls"] = [href]
@@ -318,13 +332,11 @@ class OnlyFansDetector:
             ]
             
             for selector in button_selectors:
-                elements = page.locator(selector)
-                count = await elements.count()
+                elements = await page.querySelectorAll(selector)
                 
-                for i in range(min(count, 20)):
+                for element in elements[:20]:  # Check first 20 elements
                     try:
-                        element = elements.nth(i)
-                        href = await element.get_attribute('href')
+                        href = await page.evaluate('(el) => el.href', element)
                         if href and 'onlyfans.com' in href.lower() and '/files' not in href:
                             self.results["has_onlyfans"] = True
                             self.results["onlyfans_urls"] = [href]
