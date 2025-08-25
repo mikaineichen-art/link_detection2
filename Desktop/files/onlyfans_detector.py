@@ -89,7 +89,20 @@ class OnlyFansDetector:
         """Use Playwright to interact with the page and detect OnlyFans"""
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=self.headless)
+                # Heroku-compatible browser launch with specific flags
+                browser = await p.chromium.launch(
+                    headless=self.headless,
+                    args=[
+                        '--no-sandbox',
+                        '--disable-setuid-sandbox',
+                        '--disable-dev-shm-usage',
+                        '--disable-accelerated-2d-canvas',
+                        '--no-first-run',
+                        '--no-zygote',
+                        '--disable-gpu',
+                        '--single-process'
+                    ]
+                )
                 context = await browser.new_context()
                 page = await context.new_page()
                 
