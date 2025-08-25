@@ -3,6 +3,7 @@
 Standalone OnlyFans Detector for n8n Integration
 Detects OnlyFans links in bio landing pages (Linktree, Linkme, Beacons, etc.)
 Uses pyppeteer (Puppeteer for Python) for better Heroku compatibility
+UPDATED: Converted from Playwright to Puppeteer for Heroku compatibility
 """
 
 import asyncio
