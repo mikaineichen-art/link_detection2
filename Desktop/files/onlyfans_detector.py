@@ -3,8 +3,7 @@
 Standalone OnlyFans Detector for n8n Integration
 Detects OnlyFans links in bio landing pages (Linktree, Linkme, Beacons, etc.)
 Uses pyppeteer (Puppeteer for Python) for better Heroku compatibility
-UPDATED: Converted from Playwright to Puppeteer for Heroku compatibility
-FORCE REBUILD: This file has been completely converted to use Puppeteer
+COMPLETELY REWRITTEN: Converted from Playwright to Puppeteer
 """
 
 import asyncio
@@ -16,7 +15,6 @@ from typing import Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
 import httpx
-# FORCE REBUILD: Changed from playwright to pyppeteer
 from pyppeteer import launch
 
 # OnlyFans detection regex
@@ -203,154 +201,72 @@ class OnlyFansDetector:
                 }
             ''')
             
-            for href in hrefs:
-                if href and href.startswith('http'):
-                    links.append(href)
-                elif href and href.startswith('/'):
-                    full_url = urljoin(base_url, href)
-                    links.append(full_url)
-            
-            # Check for data attributes
+            # Get all data-url attributes
             data_urls = await page.evaluate('''
                 () => {
-                    const elements = document.querySelectorAll('[data-url], [data-href], [data-link], [data-target]');
-                    return Array.from(elements).map(el => {
-                        return el.getAttribute('data-url') || el.getAttribute('data-href') || 
-                               el.getAttribute('data-link') || el.getAttribute('data-target');
-                    }).filter(url => url);
+                    const elements = document.querySelectorAll('[data-url]');
+                    return Array.from(elements).map(el => el.getAttribute('data-url'));
                 }
             ''')
             
-            for url in data_urls:
-                if url and ('http' in url or '/' in url):
-                    if url.startswith('http'):
-                        links.append(url)
-                    elif url.startswith('/'):
-                        links.append(urljoin(base_url, url))
-            
-            # Check page content for OnlyFans URLs
-            try:
-                page_text = await page.evaluate('() => document.body.innerText')
-                text_urls = re.findall(r'https?://[^\s<>"\']*onlyfans\.com[^\s<>"\']*', page_text, re.IGNORECASE)
-                links.extend(text_urls)
-            except Exception:
-                pass
-                
+            # Combine and filter
+            all_urls = hrefs + data_urls
+            for url in all_urls:
+                if url and url.startswith('http'):
+                    links.append(url)
+                elif url and url.startswith('/'):
+                    links.append(urljoin(base_url, url))
+                    
         except Exception as e:
             self.results["errors"].append(f"Link extraction failed: {str(e)}")
         
-        return list(set(links))  # Remove duplicates
+        return links
     
     async def _try_interactive_clicks(self, page, base_url: str) -> bool:
-        """Try clicking interactive elements to trigger OnlyFans redirects"""
+        """Try clicking various interactive elements to trigger redirects"""
         try:
-            domain = urlparse(base_url).netloc.lower()
+            # Common button selectors that might lead to OnlyFans
+            click_selectors = [
+                'button',
+                '.btn',
+                '.button',
+                '[role="button"]',
+                'a[href="#"]',
+                '.social-link',
+                '.profile-link'
+            ]
             
-            # Platform-specific click strategies
-            if 'link.me' in domain:
-                return await self._handle_linkme_clicks(page)
-            elif 'linktr.ee' in domain:
-                return await self._handle_linktree_clicks(page)
-            elif 'beacons.ai' in domain or 'getmysocial.com' in domain:
-                return await self._handle_generic_clicks(page)
-            
-        except Exception as e:
-            self.results["errors"].append(f"Interactive clicks failed: {str(e)}")
-        
-        return False
-    
-    async def _handle_linkme_clicks(self, page) -> bool:
-        """Handle Link.me specific click patterns"""
-        try:
-            # Look for OnlyFans container and click it
-            onlyfans_container = await page.querySelector(".singlealbum.singlebigitem.socialmedialink")
-            
-            if onlyfans_container:
-                # Check if it contains OnlyFans text
-                text = await page.evaluate('(el) => el.textContent', onlyfans_container)
-                if 'onlyfans' in text.lower():
-                    await onlyfans_container.click()
-                    await page.waitFor(3000)
-                    
-                    # Look for Continue button
-                    continue_selectors = [
-                        "button:has-text('Continue')",
-                        "button:has-text('CONTINUE')",
-                        "button:has-text('Proceed')",
-                        "button:has-text('Enter')"
-                    ]
-                    
-                    for selector in continue_selectors:
+            for selector in click_selectors:
+                try:
+                    elements = await page.querySelectorAll(selector)
+                    for element in elements[:5]:  # Limit to first 5 elements
                         try:
-                            continue_btn = await page.querySelector(selector)
-                            if continue_btn:
-                                await continue_btn.click()
-                                await page.waitFor(5000)
+                            # Check if element has text that might indicate OnlyFans
+                            text = await page.evaluate('el => el.textContent', element)
+                            if text and any(keyword in text.lower() for keyword in ['onlyfans', 'of', 'premium', 'exclusive']):
+                                await element.click()
+                                await page.waitFor(3000)
                                 
+                                # Check if we got redirected to OnlyFans
                                 current_url = page.url
-                                if 'onlyfans.com' in current_url.lower() and '/files' not in current_url:
+                                if OF_REGEX.search(current_url) and '/files' not in current_url and '/public' not in current_url:
                                     self.results["has_onlyfans"] = True
                                     self.results["onlyfans_urls"] = [current_url]
-                                    self.results["detection_method"] = "linkme_interactive"
-                                    self.results["debug_info"].append("Successfully clicked through Link.me OnlyFans flow")
+                                    self.results["detection_method"] = "interactive_click"
+                                    self.results["debug_info"].append(f"Found OnlyFans via click: {text}")
                                     return True
+                                
+                                # Go back to original page
+                                await page.goto(base_url, {'waitUntil': 'domcontentloaded'})
+                                
                         except Exception:
                             continue
-            
-        except Exception as e:
-            self.results["errors"].append(f"Link.me clicks failed: {str(e)}")
-        
-        return False
-    
-    async def _handle_linktree_clicks(self, page) -> bool:
-        """Handle Linktree specific click patterns"""
-        try:
-            # Look for LinkButton elements
-            link_buttons = await page.querySelectorAll("[data-testid*='LinkButton']")
-            
-            for button in link_buttons[:10]:  # Check first 10 buttons
-                try:
-                    href = await page.evaluate('(el) => el.href', button)
-                    if href and 'onlyfans.com' in href.lower() and '/files' not in href:
-                        self.results["has_onlyfans"] = True
-                        self.results["onlyfans_urls"] = [href]
-                        self.results["detection_method"] = "linktree_direct"
-                        self.results["debug_info"].append("Found OnlyFans link in Linktree")
-                        return True
+                            
                 except Exception:
                     continue
                     
         except Exception as e:
-            self.results["errors"].append(f"Linktree clicks failed: {str(e)}")
-        
-        return False
-    
-    async def _handle_generic_clicks(self, page) -> bool:
-        """Handle generic platform clicks"""
-        try:
-            # Look for common button/link classes
-            button_selectors = [
-                ".link-button", ".social-link", ".external-link", 
-                "[class*='button']", "[class*='link']", "[class*='social']"
-            ]
-            
-            for selector in button_selectors:
-                elements = await page.querySelectorAll(selector)
-                
-                for element in elements[:20]:  # Check first 20 elements
-                    try:
-                        href = await page.evaluate('(el) => el.href', element)
-                        if href and 'onlyfans.com' in href.lower() and '/files' not in href:
-                            self.results["has_onlyfans"] = True
-                            self.results["onlyfans_urls"] = [href]
-                            self.results["detection_method"] = "generic_platform"
-                            self.results["debug_info"].append("Found OnlyFans link in generic platform")
-                            return True
-                    except Exception:
-                        continue
-                        
-        except Exception as e:
-            self.results["errors"].append(f"Generic clicks failed: {str(e)}")
+            self.results["errors"].append(f"Interactive clicks failed: {str(e)}")
         
         return False
     

@@ -8,7 +8,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import asyncio
 import logging
-from onlyfans_detector_v2 import detect_onlyfans_in_bio_link
+from onlyfans_detector import detect_onlyfans_in_bio_link
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
