@@ -1,2 +1,2 @@
 web: gunicorn app:app
-release: playwright install chromium
+release: playwright install chromium --with-deps
